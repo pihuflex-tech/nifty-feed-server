@@ -1,0 +1,17 @@
+# Environment & Secrets
+.env
+venv/
+env/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+
+# Cached Scrip Data
+OpenAPIScripMaster.json
+filtered_nifty_scrips.json
+
+# Logs & OS artifacts
+*.log
+.DS_Store
+Thumbs.db
