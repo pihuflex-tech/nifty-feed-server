@@ -1,3 +1,4 @@
 smartapi-python>=1.5.0
 pyotp>=2.8.0
 websocket-client>=1.6.0
+pytest>=7.0.0

@@ -1,17 +1,33 @@
 # Environment & Secrets
 .env
+.env.*
+!.env.example
 venv/
 env/
+.venv/
 
-# Python Cache
+# Python Cache & Runtime
 __pycache__/
 *.py[cod]
+*$py.class
 
 # Cached Scrip Data
 OpenAPIScripMaster.json
 filtered_nifty_scrips.json
+*.tmp
 
-# Logs & OS artifacts
+# Logs & Monitoring
+logs/
 *.log
+*/logs/*
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS & Editor Artifacts
 .DS_Store
 Thumbs.db
+.vscode/
+.idea/

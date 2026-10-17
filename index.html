@@ -6,86 +6,625 @@
   <title>NIFTY 50 — Live Option Chain Feed</title>
   <style>
     :root {
-      --bg: #0d1117;
-      --card: #161b22;
-      --border: #30363d;
-      --text: #c9d1d9;
+      --bg: #090d13;
+      --card-bg: #121820;
+      --header-bg: #161e29;
+      --border: #242f3e;
+      --text-main: #e2e8f0;
+      --text-muted: #94a3b8;
+      --call-color: #38bdf8;
+      --call-up: #4ade80;
+      --put-color: #f87171;
+      --atm-bg: rgba(56, 189, 248, 0.12);
+      --atm-border: rgba(56, 189, 248, 0.4);
+      --badge-connected: #22c55e;
+      --badge-stale: #eab308;
+      --badge-error: #ef4444;
     }
+
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { background: var(--bg); color: var(--text); font-family: monospace; padding: 16px; font-size: 13px; }
-    .header { background: var(--card); border: 1px solid var(--border); padding: 12px 16px; border-radius: 6px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
-    .spot-box { font-size: 16px; font-weight: bold; color: #fff; }
-    table { width: 100%; border-collapse: collapse; background: var(--card); border-radius: 6px; overflow: hidden; }
-    th, td { padding: 6px 12px; text-align: center; border-bottom: 1px solid var(--border); }
-    th { background: #21262d; text-transform: uppercase; font-size: 11px; }
-    .call-ltp { color: #3fb950; font-weight: bold; }
-    .put-ltp { color: #f85149; font-weight: bold; }
-    .strike { font-weight: bold; color: #fff; background: rgba(255,255,255,0.02); }
-    .atm-row { background: rgba(31, 111, 235, 0.25) !important; }
+    
+    body {
+      background: var(--bg);
+      color: var(--text-main);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      padding: 14px;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    /* Top Control & Status Header */
+    .header {
+      background: var(--header-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px 16px;
+      margin-bottom: 12px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 10px;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+    }
+
+    .brand-section {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      font-weight: 500;
+      padding: 3px 8px;
+      border-radius: 9999px;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--border);
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--badge-connected);
+    }
+
+    .status-dot.stale { background: var(--badge-stale); }
+    .status-dot.error { background: var(--badge-error); }
+
+    .market-stats {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .stat-pill {
+      background: rgba(0, 0, 0, 0.3);
+      padding: 4px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+    }
+
+    .stat-val {
+      font-weight: 700;
+      color: #fff;
+    }
+
+    /* Controls Bar */
+    .controls {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+      font-size: 12px;
+    }
+
+    .control-group {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    select, button {
+      background: var(--card-bg);
+      color: var(--text-main);
+      border: 1px solid var(--border);
+      padding: 5px 9px;
+      border-radius: 6px;
+      font-size: 12px;
+      cursor: pointer;
+      outline: none;
+      transition: background 0.15s, border-color 0.15s;
+    }
+
+    select:focus, button:focus {
+      border-color: var(--call-color);
+    }
+
+    button:hover, select:hover {
+      background: rgba(255, 255, 255, 0.08);
+    }
+
+    /* Option Chain Table Container */
+    .table-container {
+      width: 100%;
+      overflow-x: auto;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--card-bg);
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-variant-numeric: tabular-nums;
+      min-width: 520px;
+    }
+
+    th, td {
+      padding: 7px 12px;
+      text-align: center;
+      border-bottom: 1px solid var(--border);
+    }
+
+    th {
+      background: #17202c;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--text-muted);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+
+    .strike-col {
+      font-weight: 700;
+      color: #fff;
+      background: rgba(255, 255, 255, 0.02);
+      border-left: 1px solid var(--border);
+      border-right: 1px solid var(--border);
+      width: 110px;
+    }
+
+    .call-ltp {
+      color: var(--call-up);
+      font-weight: 700;
+      text-align: right;
+      padding-right: 18px;
+      width: 120px;
+    }
+
+    .put-ltp {
+      color: var(--put-color);
+      font-weight: 700;
+      text-align: left;
+      padding-left: 18px;
+      width: 120px;
+    }
+
+    .symbol-col {
+      color: var(--text-muted);
+      font-size: 11px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+
+    .symbol-col.hidden {
+      display: none;
+    }
+
+    /* Row Moneyness and ATM States */
+    .atm-row {
+      background: var(--atm-bg) !important;
+      outline: 1px solid var(--atm-border);
+      font-weight: 600;
+    }
+
+    .atm-badge {
+      background: #0284c7;
+      color: #fff;
+      font-size: 9px;
+      padding: 1px 5px;
+      border-radius: 4px;
+      margin-left: 6px;
+      font-weight: 700;
+      vertical-align: middle;
+    }
+
+    /* Optional Price Tick Flash Micro-Animations (Off by default) */
+    @keyframes tickUpFlash {
+      0% { background-color: rgba(74, 222, 128, 0.35); }
+      100% { background-color: transparent; }
+    }
+
+    @keyframes tickDownFlash {
+      0% { background-color: rgba(239, 68, 68, 0.35); }
+      100% { background-color: transparent; }
+    }
+
+    .tick-up {
+      animation: tickUpFlash 0.35s ease-out;
+    }
+
+    .tick-down {
+      animation: tickDownFlash 0.35s ease-out;
+    }
+
+    /* Responsive Mobile Layout */
+    @media (max-width: 680px) {
+      .header {
+        flex-direction: column;
+        align-items: stretch;
+      }
+      .controls {
+        justify-content: space-between;
+      }
+      .symbol-col {
+        display: none;
+      }
+      table {
+        min-width: 100%;
+      }
+    }
   </style>
 </head>
 <body>
+
+  <!-- Top Navigation & Controls Header -->
   <div class="header">
-    <div><strong>NIFTY FEED BROADCASTER</strong> | <span id="status">Connecting to 127.0.0.1:5555...</span></div>
-    <div class="spot-box">Spot: <span id="spot">--</span> | ATM: <span id="atm">--</span></div>
+    <div class="brand-section">
+      <strong>NIFTY LIVE FEED</strong>
+      <div id="status-badge" class="status-badge">
+        <span id="status-dot" class="status-dot"></span>
+        <span id="status-text">Connecting...</span>
+      </div>
+    </div>
+
+    <div class="market-stats">
+      <div class="stat-pill">Spot: <span id="spot-val" class="stat-val">--</span></div>
+      <div class="stat-pill">ATM: <span id="atm-val" class="stat-val">--</span></div>
+    </div>
+
+    <div class="controls">
+      <!-- Expiry Selector -->
+      <div class="control-group">
+        <label for="expiry-select">Expiry:</label>
+        <select id="expiry-select" title="Select contract expiry">
+          <option value="">Nearest Expiry</option>
+        </select>
+      </div>
+
+      <!-- Strike Range Selector -->
+      <div class="control-group">
+        <label for="strike-range">Window:</label>
+        <select id="strike-range" title="Strike range around ATM">
+          <option value="5">±5 Strikes</option>
+          <option value="10">±10 Strikes</option>
+          <option value="15" selected>±15 Strikes</option>
+          <option value="20">±20 Strikes</option>
+          <option value="0">All Strikes</option>
+        </select>
+      </div>
+
+      <!-- Red/Green Flash Toggle (Off by default) -->
+      <button id="toggle-flash" title="Toggle red/green price tick flash animation">Flash: Off</button>
+
+      <!-- Symbol Column Toggle -->
+      <button id="toggle-symbols" title="Toggle visibility of contract symbols">Symbols: Show</button>
+    </div>
   </div>
 
-  <table>
-    <thead>
-      <tr>
-        <th style="color: #3fb950;">Call LTP</th>
-        <th>Call Symbol</th>
-        <th style="color: #fff;">Strike</th>
-        <th>Put Symbol</th>
-        <th style="color: #f85149;">Put LTP</th>
-      </tr>
-    </thead>
-    <tbody id="chain-body"></tbody>
-  </table>
+  <!-- Live Option Chain Table -->
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col" style="color: #4ade80;">Call LTP (₹)</th>
+          <th scope="col" class="symbol-col">Call Symbol</th>
+          <th scope="col" class="strike-col">Strike</th>
+          <th scope="col" class="symbol-col">Put Symbol</th>
+          <th scope="col" style="color: #f87171;">Put LTP (₹)</th>
+        </tr>
+      </thead>
+      <tbody id="chain-body"></tbody>
+    </table>
+  </div>
 
   <script>
-    async function updateChain() {
+    // State storage for delta calculations and in-place DOM updates
+    const previousPrices = {};
+    let currentRenderedStrikes = [];
+    let showSymbols = localStorage.getItem("nifty_show_symbols") !== "false";
+    let enableFlash = localStorage.getItem("nifty_enable_flash") === "true"; // Defaults to FALSE (Off)
+    let selectedRange = parseInt(localStorage.getItem("nifty_strike_range") || "15", 10);
+    let knownExpiriesList = [];
+    let currentActiveExpiry = "";
+    let isPolling = false;
+    let pollTimeoutId = null;
+
+    // DOM Elements
+    const statusDot = document.getElementById("status-dot");
+    const statusText = document.getElementById("status-text");
+    const spotVal = document.getElementById("spot-val");
+    const atmVal = document.getElementById("atm-val");
+    const chainBody = document.getElementById("chain-body");
+    const strikeRangeSelect = document.getElementById("strike-range");
+    const expirySelect = document.getElementById("expiry-select");
+    const toggleSymbolsBtn = document.getElementById("toggle-symbols");
+    const toggleFlashBtn = document.getElementById("toggle-flash");
+
+    // Initialize UI controls from preferences
+    strikeRangeSelect.value = selectedRange.toString();
+    updateFlashUI();
+    updateSymbolVisibilityUI();
+
+    strikeRangeSelect.addEventListener("change", (e) => {
+      selectedRange = parseInt(e.target.value, 10);
+      localStorage.setItem("nifty_strike_range", selectedRange);
+      currentRenderedStrikes = []; // Force re-render of rows
+      fetchFeed();
+    });
+
+    toggleSymbolsBtn.addEventListener("click", () => {
+      showSymbols = !showSymbols;
+      localStorage.setItem("nifty_show_symbols", showSymbols);
+      updateSymbolVisibilityUI();
+    });
+
+    toggleFlashBtn.addEventListener("click", () => {
+      enableFlash = !enableFlash;
+      localStorage.setItem("nifty_enable_flash", enableFlash);
+      updateFlashUI();
+    });
+
+    const SERVER_URL = window.location.protocol.startsWith("http") 
+      ? window.location.origin 
+      : "http://127.0.0.1:5555";
+
+    expirySelect.addEventListener("change", async (e) => {
+      const selectedExp = e.target.value;
+      if (!selectedExp || selectedExp === currentActiveExpiry) return;
+
+      setStatus("stale", `Switching to ${formatExpiryDate(selectedExp)}...`);
+      expirySelect.disabled = true;
+
       try {
-        const res = await fetch("http://127.0.0.1:5555/", { cache: "no-store" });
-        const data = await res.json();
-        
-        const spot = parseFloat((data.spot && data.spot.ltp) || 0);
-        document.getElementById("spot").textContent = spot > 0 ? spot.toFixed(2) : "Pre-Market";
-        document.getElementById("status").textContent = `Last Tick: ${(data.spot && data.spot.updated) || "Waiting..."}`;
+        const res = await fetch(`${SERVER_URL}/set_expiry?expiry=${encodeURIComponent(selectedExp)}`);
+        const json = await res.json();
+        if (res.ok) {
+          currentActiveExpiry = selectedExp;
+          currentRenderedStrikes = []; // Clear current strikes to re-render new expiry
+          for (const k in previousPrices) delete previousPrices[k]; // Reset cross-expiry price delta comparisons
+          clearTimeout(pollTimeoutId);
+          isPolling = false;
+          await fetchFeed();
+        } else {
+          alert(`Could not switch expiry: ${json.error || 'Server error'}`);
+          expirySelect.value = currentActiveExpiry;
+        }
+      } catch (err) {
+        alert("Failed to communicate with server to switch expiry.");
+        expirySelect.value = currentActiveExpiry;
+      } finally {
+        expirySelect.disabled = false;
+      }
+    });
 
-        const strikes = Object.keys(data.contracts || {}).map(Number).sort((a, b) => a - b);
-        if (strikes.length === 0) return;
+    function updateSymbolVisibilityUI() {
+      toggleSymbolsBtn.textContent = `Symbols: ${showSymbols ? 'Show' : 'Hide'}`;
+      document.querySelectorAll(".symbol-col").forEach(el => {
+        el.classList.toggle("hidden", !showSymbols);
+      });
+    }
 
-        // Fallback to middle strike if spot is 0 (pre-market)
-        const centerStrike = spot > 0
-          ? Math.round(spot / 50) * 50
-          : strikes[Math.floor(strikes.length / 2)];
-
-        document.getElementById("atm").textContent = spot > 0 ? centerStrike : `${centerStrike} (Est)`;
-
-        const displayStrikes = strikes.filter(s => Math.abs(s - centerStrike) <= 750);
-
-        document.getElementById("chain-body").innerHTML = displayStrikes.map(s => {
-          const c = data.contracts[s.toString()];
-          const ce = (c && c.CE) || {};
-          const pe = (c && c.PE) || {};
-          const isAtm = s === centerStrike;
-          return `
-            <tr class="${isAtm ? 'atm-row' : ''}">
-              <td class="call-ltp">${ce.ltp !== null && ce.ltp !== undefined ? '₹' + Number(ce.ltp).toFixed(2) : '--'}</td>
-              <td style="color: #8b949e; font-size: 11px;">${ce.symbol || '--'}</td>
-              <td class="strike">${s}</td>
-              <td style="color: #8b949e; font-size: 11px;">${pe.symbol || '--'}</td>
-              <td class="put-ltp">${pe.ltp !== null && pe.ltp !== undefined ? '₹' + Number(pe.ltp).toFixed(2) : '--'}</td>
-            </tr>
-          `;
-        }).join("");
-      } catch(e) {
-        document.getElementById("status").textContent = "Waiting for server.py at http://127.0.0.1:5555/...";
+    function updateFlashUI() {
+      toggleFlashBtn.textContent = `Flash: ${enableFlash ? 'On' : 'Off'}`;
+      toggleFlashBtn.style.color = enableFlash ? '#4ade80' : 'var(--text-muted)';
+      // Clear any leftover animation classes if flash is disabled
+      if (!enableFlash) {
+        document.querySelectorAll(".tick-up, .tick-down").forEach(el => {
+          el.classList.remove("tick-up", "tick-down");
+        });
       }
     }
-    setInterval(updateChain, 500);
-    updateChain();
+
+    function setStatus(state, message) {
+      statusText.textContent = message;
+      statusDot.className = "status-dot";
+      if (state === "stale") statusDot.classList.add("stale");
+      if (state === "error") statusDot.classList.add("error");
+    }
+
+    function formatExpiryDate(dateStr) {
+      if (!dateStr) return "";
+      try {
+        const parts = dateStr.split("-");
+        if (parts.length === 3) {
+          const d = new Date(parts[0], parts[1] - 1, parts[2]);
+          return d.toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
+        }
+      } catch (e) {}
+      return dateStr;
+    }
+
+    function updateExpiryDropdown(availableExpiries, activeExpiry) {
+      if (!availableExpiries || availableExpiries.length === 0) return;
+      currentActiveExpiry = activeExpiry || availableExpiries[0];
+
+      const key = availableExpiries.join(",");
+      if (key === knownExpiriesList.join(",")) {
+        if (expirySelect.value !== currentActiveExpiry) {
+          expirySelect.value = currentActiveExpiry;
+        }
+        return;
+      }
+
+      knownExpiriesList = availableExpiries;
+      const labels = ["Current", "Next", "Far"];
+      expirySelect.innerHTML = availableExpiries.map((exp, idx) => `
+        <option value="${exp}" ${exp === currentActiveExpiry ? 'selected' : ''}>
+          ${formatExpiryDate(exp)}${idx < labels.length ? ' (' + labels[idx] + ')' : ''}
+        </option>
+      `).join("");
+    }
+
+    // High-performance in-place DOM row builder & updater
+    function renderOptionChain(data) {
+      const spot = parseFloat((data.spot && data.spot.ltp) || 0);
+      spotVal.textContent = spot > 0 ? spot.toFixed(2) : "Pre-Market";
+
+      // Update available expiries in dropdown
+      if (data.available_expiries && data.available_expiries.length > 0) {
+        updateExpiryDropdown(data.available_expiries, data.expiry);
+      } else if (knownExpiriesList.length === 0) {
+        // Fallback query if available_expiries omitted in payload
+        fetch(`${SERVER_URL}/expiries`)
+          .then(r => r.json())
+          .then(expData => {
+            if (expData.available_expiries) {
+              updateExpiryDropdown(expData.available_expiries, expData.current_expiry || data.expiry);
+            }
+          })
+          .catch(() => {});
+      }
+
+      const strikes = Object.keys(data.contracts || {}).map(Number).sort((a, b) => a - b);
+      if (strikes.length === 0) return;
+
+      const centerStrike = spot > 0
+        ? Math.round(spot / 50) * 50
+        : strikes[Math.floor(strikes.length / 2)];
+
+      atmVal.textContent = spot > 0 ? centerStrike : `${centerStrike} (Est)`;
+
+      // Filter strikes based on user selection
+      let displayStrikes = strikes;
+      if (selectedRange > 0) {
+        let centerIdx = strikes.findIndex(s => s >= centerStrike);
+        if (centerIdx === -1) {
+          centerIdx = strikes.length - 1;
+        }
+        const start = Math.max(0, centerIdx - selectedRange);
+        const end = Math.min(strikes.length, start + selectedRange * 2 + 1);
+        displayStrikes = strikes.slice(start, end);
+      }
+
+      // Check if rendered strike list changed (rebuild rows only when necessary)
+      const strikeListKey = displayStrikes.join(",");
+      if (strikeListKey !== currentRenderedStrikes.join(",")) {
+        currentRenderedStrikes = displayStrikes;
+        chainBody.innerHTML = displayStrikes.map(s => `
+          <tr id="row-${s}" data-strike="${s}">
+            <td class="call-ltp cell-call-ltp">--</td>
+            <td class="symbol-col cell-call-sym ${showSymbols ? '' : 'hidden'}">--</td>
+            <td class="strike-col cell-strike">
+              <span>${s}</span>
+              <span class="atm-badge" style="display:none;">ATM</span>
+            </td>
+            <td class="symbol-col cell-put-sym ${showSymbols ? '' : 'hidden'}">--</td>
+            <td class="put-ltp cell-put-ltp">--</td>
+          </tr>
+        `).join("");
+      }
+
+      // In-place updates for prices with optional directional flash
+      for (const s of displayStrikes) {
+        const row = document.getElementById(`row-${s}`);
+        if (!row) continue;
+
+        const contract = data.contracts[s.toString()] || {};
+        const ce = contract.CE || {};
+        const pe = contract.PE || {};
+        const isAtm = s === centerStrike;
+
+        row.classList.toggle("atm-row", isAtm);
+        const atmBadge = row.querySelector(".atm-badge");
+        if (atmBadge) atmBadge.style.display = isAtm ? "inline-block" : "none";
+
+        // Update Call LTP
+        const callCell = row.querySelector(".cell-call-ltp");
+        if (callCell) {
+          const newCallLtp = ce.ltp !== null && ce.ltp !== undefined ? Number(ce.ltp) : null;
+          const oldCallLtp = previousPrices[`${s}_CE`];
+          
+          if (newCallLtp !== null) {
+            callCell.textContent = '₹' + newCallLtp.toFixed(2);
+            if (enableFlash && oldCallLtp !== undefined && oldCallLtp !== null && newCallLtp !== oldCallLtp) {
+              callCell.classList.remove("tick-up", "tick-down");
+              void callCell.offsetWidth; // Trigger reflow to restart CSS animation
+              callCell.classList.add(newCallLtp > oldCallLtp ? "tick-up" : "tick-down");
+            }
+            previousPrices[`${s}_CE`] = newCallLtp;
+          } else {
+            callCell.textContent = "--";
+          }
+        }
+
+        // Update Put LTP
+        const putCell = row.querySelector(".cell-put-ltp");
+        if (putCell) {
+          const newPutLtp = pe.ltp !== null && pe.ltp !== undefined ? Number(pe.ltp) : null;
+          const oldPutLtp = previousPrices[`${s}_PE`];
+          
+          if (newPutLtp !== null) {
+            putCell.textContent = '₹' + newPutLtp.toFixed(2);
+            if (enableFlash && oldPutLtp !== undefined && oldPutLtp !== null && newPutLtp !== oldPutLtp) {
+              putCell.classList.remove("tick-up", "tick-down");
+              void putCell.offsetWidth;
+              putCell.classList.add(newPutLtp > oldPutLtp ? "tick-up" : "tick-down");
+            }
+            previousPrices[`${s}_PE`] = newPutLtp;
+          } else {
+            putCell.textContent = "--";
+          }
+        }
+
+        // Update Symbols
+        const callSymCell = row.querySelector(".cell-call-sym");
+        if (callSymCell && ce.symbol) callSymCell.textContent = ce.symbol;
+        const putSymCell = row.querySelector(".cell-put-sym");
+        if (putSymCell && pe.symbol) putSymCell.textContent = pe.symbol;
+      }
+    }
+
+    // Chained async polling with timeout and error recovery
+    async function fetchFeed() {
+      if (isPolling) return;
+      isPolling = true;
+
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 2500);
+
+      try {
+        const res = await fetch(`${SERVER_URL}/`, {
+          cache: "no-store",
+          signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+
+        renderOptionChain(data);
+
+        const updated = (data.spot && data.spot.updated) || "Pre-Market";
+        const expLabel = data.expiry ? ` [${formatExpiryDate(data.expiry)}]` : "";
+        setStatus("connected", updated === "Pre-Market" ? `Connected (${updated})${expLabel}` : `Live Tick: ${updated}${expLabel}`);
+      } catch (err) {
+        if (err.name === "AbortError") {
+          setStatus("stale", "Feed Latency > 2.5s...");
+        } else {
+          setStatus("error", "Waiting for server (Port 5555)...");
+        }
+      } finally {
+        isPolling = false;
+        if (!document.hidden) {
+          pollTimeoutId = setTimeout(fetchFeed, 500);
+        }
+      }
+    }
+
+    // Pause polling when tab is inactive to conserve mobile battery and CPU
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        clearTimeout(pollTimeoutId);
+      } else {
+        clearTimeout(pollTimeoutId);
+        isPolling = false;
+        fetchFeed();
+      }
+    });
+
+    // Start feed
+    fetchFeed();
   </script>
 </body>
 </html>
