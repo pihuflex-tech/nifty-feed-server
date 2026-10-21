@@ -1,322 +1,217 @@
 """
-Angel One Instrument Master Downloader, Parser, and Fast-Cache Manager
-Handles CDN download, nearest/target expiry selection, strike parsing, and atomic caching.
+scrip_master.py
+Fetches OpenAPI instrument master and filters precisely 92 curated tokens
+for Angel One SmartAPI 2.0 Mode 2 streaming.
+Locks strike generation strictly to 92 tokens.
 """
 
 import os
 import json
-import time
-from datetime import datetime, date, time as dt_time
-from typing import Dict, List, Optional, Tuple, Any
-from urllib.request import urlopen, Request
+import urllib.request
+from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Any
 
-import config
+SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+OUTPUT_FILE = "filtered_nifty_scrips.json"
 
+# Fixed Indices (NSE Cash, Exchange Type = 1) - 3 Tokens
+INDICES_TOKENS = {
+    "NIFTY_50": {"token": "99926000", "symbol": "Nifty 50", "exch_seg": "nse_cm"},
+    "INDIA_VIX": {"token": "99926017", "symbol": "India VIX", "exch_seg": "nse_cm"},
+    "BANKNIFTY": {"token": "99926009", "symbol": "Nifty Bank", "exch_seg": "nse_cm"}
+}
 
-def get_market_timezone():
-    """Returns ZoneInfo or static UTC+05:30 fallback for Termux environments without tzdata."""
-    try:
-        from zoneinfo import ZoneInfo
-        return ZoneInfo(config.MARKET_TIMEZONE)
-    except Exception:
-        from datetime import timezone, timedelta
-        return timezone(timedelta(hours=5, minutes=30))
-
-
-def get_market_now(now_dt: Optional[datetime] = None) -> datetime:
-    """Returns current datetime in market timezone (Asia/Kolkata)."""
-    tz = get_market_timezone()
-    if now_dt is not None:
-        if now_dt.tzinfo is None:
-            return now_dt.replace(tzinfo=tz)
-        return now_dt
-    return datetime.now(tz)
+# Top Heavyweights (NSE Cash) - 4 Tokens
+HEAVYWEIGHT_SYMBOLS = ["RELIANCE-EQ", "HDFCBANK-EQ", "ICICIBANK-EQ", "INFY-EQ"]
 
 
-def get_session_cutoff_time() -> dt_time:
-    """Parses session cutoff time (HH:MM:SS) from config."""
-    parts = [int(p) for p in config.SESSION_CUTOFF_TIME.split(":")]
-    return dt_time(parts[0], parts[1], parts[2] if len(parts) > 2 else 0)
+def get_market_now() -> datetime:
+    """Returns current IST datetime."""
+    utc_now = datetime.now(timezone.utc)
+    ist_tz = timezone(timedelta(hours=5, minutes=30))
+    return utc_now.astimezone(ist_tz)
 
 
-def save_cache_atomic(filepath: str, data: Any) -> None:
-    """Writes data to a temporary file in the target directory and replaces atomically."""
-    dir_name = os.path.dirname(os.path.abspath(filepath))
-    temp_path = os.path.join(dir_name, f".{os.path.basename(filepath)}.tmp")
-    try:
-        with open(temp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(temp_path, filepath)
-    except Exception:
-        if os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
-        raise
+def fetch_scrip_master() -> list:
+    """Downloads Angel One OpenAPIScripMaster JSON."""
+    print("[*] Downloading Angel One OpenAPIScripMaster.json...")
+    req = urllib.request.Request(
+        SCRIP_MASTER_URL,
+        headers={"User-Agent": "Mozilla/5.0"}
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    print(f"[+] Download complete. Total instruments: {len(data)}")
+    return data
 
 
-def load_or_download_scrips() -> List[Dict[str, Any]]:
-    """Fetches the master JSON from Angel One CDN with a TTL disk cache."""
-    if os.path.exists(config.SCRIP_CACHE_FILE):
-        file_age = (time.time() - os.path.getmtime(config.SCRIP_CACHE_FILE)) / 3600.0
-        if file_age < config.CACHE_EXPIRY_HOURS:
-            try:
-                print(f"[*] Reading cached master file ({config.SCRIP_CACHE_FILE})...")
-                with open(config.SCRIP_CACHE_FILE, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception as e:
-                print(f"[!] Warning: Corrupt master cache ({e}), re-downloading...")
-
-    print("[*] Downloading latest OpenAPIScripMaster.json from Angel One CDN...")
-    try:
-        req = Request(config.SCRIP_MASTER_URL, headers={"User-Agent": "Mozilla/5.0"})
-        with urlopen(req, timeout=45) as resp:
-            raw_bytes = resp.read()
-            scrip_data = json.loads(raw_bytes.decode("utf-8"))
-
+def parse_expiry(expiry_str: str) -> datetime:
+    """Parses Angel One expiry string into datetime."""
+    for fmt in ("%d%b%Y", "%d-%b-%Y"):
         try:
-            save_cache_atomic(config.SCRIP_CACHE_FILE, scrip_data)
-            print("[*] Master instruments cached successfully.")
-        except Exception as e:
-            print(f"[!] Warning: Could not write master cache file ({e}).")
-
-        return scrip_data
-    except Exception as download_err:
-        # Fallback to existing disk cache if download fails (spotty mobile connection/offline mode)
-        if os.path.exists(config.SCRIP_CACHE_FILE):
-            print(f"[!] Warning: Master CDN download failed ({download_err}). Using existing disk cache fallback.")
-            try:
-                with open(config.SCRIP_CACHE_FILE, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                pass
-        raise download_err
+            return datetime.strptime(expiry_str.strip().upper(), fmt)
+        except ValueError:
+            pass
+    raise ValueError(f"Unrecognized date format: {expiry_str}")
 
 
-def parse_expiry_date(exp_str: str) -> Optional[date]:
-    """Parses Angel One expiry strings (e.g. 23OCT2026 or 2026-10-23)."""
-    s = (exp_str or "").strip().upper()
-    if not s:
-        return None
-    try:
-        if len(s) == 9:
-            return datetime.strptime(s, "%d%b%Y").date()
-        return datetime.strptime(s, "%Y-%m-%d").date()
-    except ValueError:
-        return None
+def get_atm_strike(nifty_spot: float = 22800.0) -> int:
+    """Rounds spot to nearest 50 strike."""
+    return int(round(nifty_spot / 50.0) * 50)
 
 
-def build_expiry_contracts(series_items: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], Dict[str, Tuple[str, str]], List[str]]:
-    """Builds contracts dictionary, token map, and subscription tokens for a series of option items."""
-    temp_contracts: Dict[int, Dict[str, Any]] = {}
-    token_map: Dict[str, Tuple[str, str]] = {}
-    tokens_to_subscribe: List[str] = [config.NIFTY_SPOT_TOKEN]
+def build_filtered_tokens(all_scrips: list, estimated_spot: float = 22800.0) -> dict:
+    today = get_market_now().date()
+    atm = get_atm_strike(estimated_spot)
+    print(f"[*] Base Reference ATM Strike: {atm}")
 
-    for item in series_items:
-        token = str(item.get("token", "")).strip()
-        symbol = str(item.get("symbol", "")).strip()
-        opt_type = "CE" if symbol.endswith("CE") else ("PE" if symbol.endswith("PE") else None)
-        if not token or not opt_type:
-            continue
+    tokens_meta = {}
+    tokens_by_seg = {"nse_cm": [], "nse_fo": []}
 
-        try:
-            raw_strike = float(item.get("strike", 0.0))
-        except (ValueError, TypeError):
-            continue
-
-        # Angel One stores NFO strikes in paise (e.g. 2450000.0 -> 24500)
-        strike = int(round(raw_strike / 100.0)) if raw_strike > 100000 else int(round(raw_strike))
-        if strike <= 0:
-            continue
-
-        if strike not in temp_contracts:
-            temp_contracts[strike] = {
-                "CE": {"token": None, "symbol": None, "ltp": None},
-                "PE": {"token": None, "symbol": None, "ltp": None},
-            }
-
-        temp_contracts[strike][opt_type] = {
-            "token": token,
-            "symbol": symbol,
-            "ltp": None,
+    # 1. Spot & Sentiment Indices (3 Tokens)
+    for name, item in INDICES_TOKENS.items():
+        t = str(item["token"])
+        tokens_meta[t] = {
+            "name": name,
+            "symbol": item["symbol"],
+            "exch_seg": item["exch_seg"],
+            "category": "index"
         }
+        tokens_by_seg[item["exch_seg"]].append(t)
 
-        token_map[token] = (str(strike), opt_type)
-        if token not in tokens_to_subscribe:
-            tokens_to_subscribe.append(token)
+    # 2. Top Heavyweights (4 Tokens)
+    for scrip in all_scrips:
+        if scrip.get("exch_seg") == "NSE" and scrip.get("symbol") in HEAVYWEIGHT_SYMBOLS:
+            t = str(scrip["token"])
+            tokens_meta[t] = {
+                "name": scrip.get("name", ""),
+                "symbol": scrip.get("symbol", ""),
+                "exch_seg": "nse_cm",
+                "category": "heavyweight"
+            }
+            tokens_by_seg["nse_cm"].append(t)
 
-    contracts_template = {str(k): temp_contracts[k] for k in sorted(temp_contracts.keys())}
-    return contracts_template, token_map, tokens_to_subscribe
+    # 3. Filter Nifty Derivatives
+    nifty_options = []
+    nifty_futures = []
 
+    for scrip in all_scrips:
+        if scrip.get("exch_seg") != "NFO" or scrip.get("name") != "NIFTY":
+            continue
 
-def filter_instruments_data(
-    scrip_data: List[Dict[str, Any]],
-    now_dt: Optional[datetime] = None,
-    target_expiry: Optional[date] = None,
-    return_all_cache: bool = False,
-):
-    """
-    Pure filtering logic for NIFTY options based on current market time or target expiry.
-    Filters the top 3 active upcoming expiries.
-    Returns (contracts_template, token_map, tokens_to_subscribe, selected_expiry, all_active_expiries).
-    """
-    now = get_market_now(now_dt)
-    today = now.date()
-    cutoff_time = get_session_cutoff_time()
-
-    nifty_options: List[Dict[str, Any]] = []
-
-    for item in scrip_data:
-        if (
-            item.get("exch_seg") == "NFO"
-            and item.get("instrumenttype") == "OPTIDX"
-            and item.get("name") == "NIFTY"
-        ):
-            exp_date = parse_expiry_date(item.get("expiry", ""))
-            if not exp_date:
+        instrumenttype = scrip.get("instrumenttype", "")
+        if instrumenttype in ("OPTIDX", "OPTSTK"):
+            try:
+                exp_dt = parse_expiry(scrip["expiry"])
+                if exp_dt.date() >= today:
+                    nifty_options.append((exp_dt, scrip))
+            except Exception:
+                continue
+        elif instrumenttype in ("FUTIDX", "FUTSTK"):
+            try:
+                exp_dt = parse_expiry(scrip["expiry"])
+                if exp_dt.date() >= today:
+                    nifty_futures.append((exp_dt, scrip))
+            except Exception:
                 continue
 
-            # Expiry selection policy:
-            # 1. Future date: active
-            # 2. Today: active ONLY if market time is before session cutoff
-            # 3. Past date or today after cutoff: expired
-            if exp_date > today or (exp_date == today and now.time() < cutoff_time):
-                item["_parsed_expiry"] = exp_date
-                nifty_options.append(item)
-
-    if not nifty_options:
-        raise RuntimeError("No active NIFTY options found matching current market session.")
-
-    # Normalize target_expiry if provided as datetime or string
-    if isinstance(target_expiry, datetime):
-        target_expiry = target_expiry.date()
-    elif isinstance(target_expiry, str):
-        target_expiry = parse_expiry_date(target_expiry)
-
-    # Fetch top 3 active expiries
-    all_active_expiries = sorted(list(set(item["_parsed_expiry"] for item in nifty_options)))[:3]
-
-    if target_expiry and target_expiry in all_active_expiries:
-        selected_expiry = target_expiry
-    else:
-        selected_expiry = all_active_expiries[0]
-
-    # Pre-compute contracts and token maps for all top 3 active expiries
-    expiries_cache: Dict[str, Dict[str, Any]] = {}
-    for exp in all_active_expiries:
-        exp_str = str(exp)
-        series_items = [item for item in nifty_options if item["_parsed_expiry"] == exp]
-        c_tmpl, t_map, s_tokens = build_expiry_contracts(series_items)
-        expiries_cache[exp_str] = {
-            "contracts": c_tmpl,
-            "token_map": t_map,
-            "tokens_to_subscribe": s_tokens,
+    # 4. Nifty Current Month Futures (1 Token)
+    nifty_futures.sort(key=lambda x: x[0])
+    if nifty_futures:
+        fut_dt, fut_scrip = nifty_futures[0]
+        t = str(fut_scrip["token"])
+        tokens_meta[t] = {
+            "name": "NIFTY_FUT",
+            "symbol": fut_scrip["symbol"],
+            "expiry": fut_dt.strftime("%d%b%Y"),
+            "exch_seg": "nse_fo",
+            "category": "futures"
         }
+        tokens_by_seg["nse_fo"].append(t)
 
-    selected_exp_str = str(selected_expiry)
-    selected_data = expiries_cache[selected_exp_str]
-    contracts_template = selected_data["contracts"]
-    token_map = selected_data["token_map"]
-    tokens_to_subscribe = selected_data["tokens_to_subscribe"]
+    # 5. Extract Expiries
+    unique_expiries = sorted(list({x[0] for x in nifty_options}))
+    if len(unique_expiries) < 2:
+        raise RuntimeError("Insufficient active option expiries found in scrip master.")
 
-    if return_all_cache:
-        return contracts_template, token_map, tokens_to_subscribe, selected_expiry, all_active_expiries, expiries_cache
-    return contracts_template, token_map, tokens_to_subscribe, selected_expiry, all_active_expiries
+    current_expiry = unique_expiries[0]
+    next_expiry = unique_expiries[1]
 
+    # Detect Monthly Expiry
+    monthly_expiry = None
+    for exp in reversed(unique_expiries):
+        if exp.month == current_expiry.month:
+            monthly_expiry = exp
+            break
+    if not monthly_expiry or monthly_expiry in (current_expiry, next_expiry):
+        monthly_expiry = unique_expiries[min(len(unique_expiries) - 1, 3)]
 
-def filter_nearest_nifty_options(
-    now_dt: Optional[datetime] = None,
-    target_expiry: Optional[date] = None,
-) -> Tuple[Dict[str, Any], Dict[str, Tuple[str, str]], List[str], str, List[str]]:
-    """
-    Loads filtered NIFTY option chain. Uses fast-cache when available and valid for requested expiry,
-    otherwise parses master instruments and saves atomic fast-cache with the top 3 active expiries.
-    Returns (contracts_template, token_map, tokens_to_subscribe, selected_expiry_str, available_expiries_str).
-    """
-    now = get_market_now(now_dt)
-    today_str = now.strftime("%Y-%m-%d")
-    cutoff_time = get_session_cutoff_time()
+    print(f"[+] Current Expiry: {current_expiry.strftime('%d-%b-%Y')}")
+    print(f"[+] Next Expiry:    {next_expiry.strftime('%d-%b-%Y')}")
+    print(f"[+] Monthly Expiry: {monthly_expiry.strftime('%d-%b-%Y')}")
 
-    # Normalize target_expiry if provided as datetime or string
-    if isinstance(target_expiry, datetime):
-        target_expiry = target_expiry.date()
-    elif isinstance(target_expiry, str):
-        target_expiry = parse_expiry_date(target_expiry)
-
-    # Fast path: Validate cached contracts
-    if os.path.exists(config.FILTERED_CACHE_FILE):
+    # Build Map: (date, strike_int, 'CE'/'PE') -> scrip
+    opt_map = {}
+    for exp_dt, scrip in nifty_options:
         try:
-            with open(config.FILTERED_CACHE_FILE, "r", encoding="utf-8") as f:
-                cached = json.load(f)
+            raw_strike = float(scrip.get("strike", 0.0))
+            strike = int(raw_strike / 100) if raw_strike > 100000 else int(raw_strike)
+            opt_type = scrip.get("symbol", "")[-2:].upper()
+            opt_map[(exp_dt.date(), strike, opt_type)] = scrip
+        except Exception:
+            continue
 
-            cached_date = cached.get("cache_date")
-            cached_avail = cached.get("available_expiries", [])
-            cached_expiries_data = cached.get("expiries_data", {})
+    def add_option_tokens(target_exp_date, strikes_list, category_name):
+        added = 0
+        for s in strikes_list:
+            for ot in ("CE", "PE"):
+                key = (target_exp_date, s, ot)
+                if key in opt_map:
+                    scrip = opt_map[key]
+                    t = str(scrip["token"])
+                    if t not in tokens_meta:
+                        tokens_meta[t] = {
+                            "symbol": scrip["symbol"],
+                            "strike": s,
+                            "option_type": ot,
+                            "expiry": target_exp_date.strftime("%d%b%Y"),
+                            "exch_seg": "nse_fo",
+                            "category": category_name
+                        }
+                        tokens_by_seg["nse_fo"].append(t)
+                        added += 1
+                else:
+                    print(f"[!] Warning: Missing strike {s} {ot} for {target_exp_date}")
+        return added
 
-            # Ensure available expiries are active (not expired today after cutoff)
-            valid_avail = []
-            for exp_s in cached_avail:
-                d = datetime.strptime(exp_s, "%Y-%m-%d").date()
-                if d > now.date() or (d == now.date() and now.time() < cutoff_time):
-                    valid_avail.append(exp_s)
+    # -------------------------------------------------------------
+    # 92 Token Allocation Logic
+    # -------------------------------------------------------------
 
-            if cached_date == today_str and len(valid_avail) > 0:
-                target_str = str(target_expiry) if target_expiry else valid_avail[0]
+    # A. Current Expiry: 44 Tokens (22 Strikes x 2)
+    # 1. Base ATM ± 9 Strikes: ATM(1) + 9 ऊपर + 9 नीचे = 19 strikes (38 tokens)
+    curr_base_strikes = [atm]
+    for i in range(1, 10):
+        curr_base_strikes.append(atm + (i * 50))
+        curr_base_strikes.append(atm - (i * 50))
+    add_option_tokens(current_expiry.date(), sorted(curr_base_strikes), "options_current")
 
-                if target_str in cached_expiries_data:
-                    exp_info = cached_expiries_data[target_str]
-                    contracts = exp_info["contracts"]
-                    token_map = {k: (v[0], v[1]) for k, v in exp_info["token_map"].items()}
-                    subs = exp_info["tokens_to_subscribe"]
-                    print(
-                        f"[*] Instant-loaded {len(contracts)} strikes for expiry "
-                        f"{target_str} from 3-expiry fast-cache."
-                    )
-                    return contracts, token_map, subs, target_str, valid_avail[:3]
+    # 2. Outer Margins / Wings: 3 स्ट्राइक्स (6 tokens) -> कुल 38 + 6 = 44 tokens
+    # ATM-600, ATM+600, और ATM+650 (जो बेस ±450 से बाहर हैं)
+    wing_strikes = [atm - 600, atm + 600, atm + 650]
+    add_option_tokens(current_expiry.date(), wing_strikes, "options_wings")
 
-                # If requested target is explicitly outside available active expiries for today, reject early
-                if target_expiry and target_str not in valid_avail and len(valid_avail) >= 3:
-                    raise ValueError(f"Requested expiry {target_str} is not in available active expiries: {valid_avail[:3]}")
+    # B. Next Weekly Expiry: 20 Tokens (10 Strikes x 2)
+    next_strikes = [atm + (i * 50) for i in range(-4, 6)]
+    add_option_tokens(next_expiry.date(), sorted(next_strikes), "options_next")
 
-                # Fallback for single cached expiry
-                cached_exp_str = cached.get("expiry")
-                if (target_str == cached_exp_str) and cached.get("contracts") and cached.get("token_map"):
-                    token_map = {k: (v[0], v[1]) for k, v in cached["token_map"].items()}
-                    return cached["contracts"], token_map, cached.get("tokens_to_subscribe", []), cached_exp_str, valid_avail[:3]
-        except Exception as e:
-            if isinstance(e, ValueError) and "not in available active expiries" in str(e):
-                raise
-            print(f"[!] Fast-cache validation note: ({e}), falling back to master scrip parse...")
+    # C. Monthly Expiry: 20 Tokens (10 Strikes x 2)
+    monthly_strikes = [atm + (i * 50) for i in range(-4, 6)]
+    add_option_tokens(monthly_expiry.date(), sorted(monthly_strikes), "options_monthly")
 
-    # Slow path: parse master instruments
-    scrip_data = load_or_download_scrips()
-    print("[*] Filtering master instruments for top 3 active NIFTY expiries...")
-    contracts_template, token_map, tokens_to_subscribe, selected_expiry, all_active_expiries, expiries_cache = filter_instruments_data(
-        scrip_data, now_dt=now, target_expiry=target_expiry, return_all_cache=True
-    )
-    del scrip_data  # Free 39 MB list from RAM immediately
-
-    selected_exp_str = str(selected_expiry)
-    avail_exp_strings = [str(d) for d in all_active_expiries]
-    print(f"[*] Active Expiry: {selected_exp_str} (Available 3 Expiries: {', '.join(avail_exp_strings)})")
-
-    # Write atomic fast-cache containing all 3 active expiries
-    try:
-        cache_payload = {
-            "cache_date": today_str,
-            "expiry": selected_exp_str,
-            "available_expiries": avail_exp_strings,
-            "contracts": contracts_template,
-            "token_map": token_map,
-            "tokens_to_subscribe": tokens_to_subscribe,
-            "expiries_data": expiries_cache,
-        }
-        save_cache_atomic(config.FILTERED_CACHE_FILE, cache_payload)
-        print(f"[*] Fast-cache saved atomically with 3 expiries ({len(contracts_template)} strikes each).")
-    except Exception as e:
-        print(f"[!] Warning: Could not write fast-cache ({e}).")
-
-    return contracts_template, token_map, tokens_to_subscribe, selected_exp_str, avail_exp_strings
+    return {
+        "generated_at": get_market_now().isoformat(),
+        "total_tokens": len(tokens_meta),
+        "tokens_by_seg": tokens_by_seg,
+        "instruments": tokens_meta
+    }

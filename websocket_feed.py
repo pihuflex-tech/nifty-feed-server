@@ -1,13 +1,15 @@
 """
-Angel One SmartAPI WebSocket 2.0 Ingestion and Reconnection Engine
-Handles TOTP session generation, chunked subscriptions, binary tick processing,
-dynamic expiry resubscriptions, and resilient exponential backoff reconnects.
+websocket_feed.py
+Angel One SmartAPI WebSocket 2.0 Ingestion and Reconnection Engine.
+Mode 2 (Quote Mode): Streams LTP, Volume, OI, High/Low, Close, Net Change.
+Handles paise-to-rupee scaling, VIX normalization, and multi-asset routing.
 """
 
 import sys
 import time
 import json
 import random
+import struct
 from datetime import datetime
 from typing import Dict, List, Tuple, Any, Optional
 
@@ -29,11 +31,18 @@ except ImportError:
 
 import pyotp
 
-# Global reference for dynamic subscription management across expiry switches
+# Binary Mode 2 Format Specifications (Fallback for raw byte streams)
+MODE_2_HEADER_FORMAT = "<BB25sqq"
+MODE_2_HEADER_SIZE = struct.calcsize(MODE_2_HEADER_FORMAT)  # 43 bytes
+MODE_2_QUOTE_FORMAT = "<qqqqddqqqqqqq"
+MODE_2_QUOTE_SIZE = struct.calcsize(MODE_2_QUOTE_FORMAT)    # 104 bytes
+TOTAL_MODE_2_SIZE = MODE_2_HEADER_SIZE + MODE_2_QUOTE_SIZE  # 147 bytes
+
+# Global state for dynamic multi-token routing & resubscription
 ACTIVE_SWS_STATE: Dict[str, Any] = {
     "instance": None,
-    "tokens": [],
-    "token_map": {},
+    "tokens_by_seg": {"nse_cm": [], "nse_fo": []},
+    "token_metadata": {},
 }
 
 
@@ -44,111 +53,227 @@ def calculate_backoff_delay(
     multiplier: float = 2.0,
     jitter: float = 0.5,
 ) -> float:
-    """Calculates bounded exponential backoff delay with optional random jitter."""
+    """Calculates bounded exponential backoff delay with random jitter."""
     delay = min(base_delay * (multiplier ** (attempt - 1)), max_delay)
     if jitter > 0:
         delay += random.uniform(0, jitter)
     return round(delay, 2)
 
 
-def process_tick_message(message: Any, token_map: Dict[str, Tuple[str, str]]) -> bool:
+def unpack_raw_mode2_binary(binary_data: bytes) -> Optional[dict]:
+    """Fallback unpacker for raw 147-byte Mode 2 binary tick packets."""
+    if len(binary_data) < TOTAL_MODE_2_SIZE:
+        return None
+
+    try:
+        header = struct.unpack(MODE_2_HEADER_FORMAT, binary_data[:MODE_2_HEADER_SIZE])
+        token = header[2].decode("utf-8").strip("\x00").strip()
+
+        quote = struct.unpack(MODE_2_QUOTE_FORMAT, binary_data[MODE_2_HEADER_SIZE:TOTAL_MODE_2_SIZE])
+        ltp = quote[0] / 100.0
+        ltq = quote[1]
+        atp = quote[2] / 100.0
+        volume = quote[3]
+        open_price = quote[6] / 100.0
+        high_price = quote[7] / 100.0
+        low_price = quote[8] / 100.0
+        close_price = quote[9] / 100.0
+        open_interest = quote[11]
+        oi_change_pct = quote[12] / 100.0
+
+        net_change = round(ltp - close_price, 2) if close_price > 0 else 0.0
+
+        return {
+            "token": token,
+            "ltp": round(ltp, 2),
+            "ltq": ltq,
+            "atp": round(atp, 2),
+            "volume": volume,
+            "open": round(open_price, 2),
+            "high": round(high_price, 2),
+            "low": round(low_price, 2),
+            "close": round(close_price, 2),
+            "net_change": net_change,
+            "open_interest": open_interest,
+            "oi_change_percent": oi_change_pct,
+        }
+    except Exception:
+        return None
+
+
+def normalize_tick_data(raw_msg: Any) -> Optional[dict]:
     """
-    Parses and routes a tick message (or list of tick messages) from SmartWebSocketV2 to broadcaster.
-    Converts integer paise to float Rupees. Returns True if at least one tick was processed.
+    Normalizes SmartWebSocketV2 Mode 2 output (dict or raw binary) into Rupee values.
+    Divides paise prices by 100.0 uniformly across all equity and derivative contracts.
     """
+    if isinstance(raw_msg, bytes):
+        return unpack_raw_mode2_binary(raw_msg)
+
+    if isinstance(raw_msg, str):
+        try:
+            raw_msg = json.loads(raw_msg)
+        except Exception:
+            return None
+
+    if not isinstance(raw_msg, dict):
+        return None
+
+    token = str(raw_msg.get("token", "")).strip()
+    raw_ltp = raw_msg.get("last_traded_price")
+    if not token or raw_ltp is None:
+        return None
+
+    try:
+        # All Mode 2 prices arrive in integer paise from exchange feed
+        ltp = round(float(raw_ltp) / 100.0, 2)
+        if ltp <= 0:
+            return None
+
+        raw_close = raw_msg.get("closed_price") or raw_msg.get("close", 0.0)
+        close_price = round(float(raw_close) / 100.0, 2)
+
+        raw_high = raw_msg.get("high_price_of_the_day") or raw_msg.get("high", 0.0)
+        high_price = round(float(raw_high) / 100.0, 2)
+
+        raw_low = raw_msg.get("low_price_of_the_day") or raw_msg.get("low", 0.0)
+        low_price = round(float(raw_low) / 100.0, 2)
+
+        volume = int(raw_msg.get("volume_trade_for_the_day") or raw_msg.get("volume", 0))
+        open_interest = int(raw_msg.get("open_interest") or raw_msg.get("oi", 0))
+        oi_change_pct = float(raw_msg.get("open_interest_change_percentage") or raw_msg.get("oi_change", 0.0))
+
+        net_change = round(ltp - close_price, 2) if close_price > 0 else 0.0
+
+        return {
+            "token": token,
+            "ltp": ltp,
+            "volume": volume,
+            "open_interest": open_interest,
+            "high": high_price,
+            "low": low_price,
+            "close": close_price,
+            "net_change": net_change,
+            "oi_change_percent": oi_change_pct,
+        }
+    except (ValueError, TypeError):
+        return None
+
+
+def process_tick_message(message: Any, meta_map: Dict[str, dict]) -> bool:
+    """Parses and routes Mode 2 ticks to broadcaster across asset categories."""
     if not message:
         return False
 
-    # Handle batch ticks if received as a list
     if isinstance(message, list):
         processed_any = False
         for m in message:
-            if process_tick_message(m, token_map):
+            if process_tick_message(m, meta_map):
                 processed_any = True
         return processed_any
 
-    try:
-        if isinstance(message, (str, bytes)):
-            message = json.loads(message)
-        if not isinstance(message, dict):
-            return False
-
-        token = str(message.get("token", "")).strip()
-        raw_ltp = message.get("last_traded_price")
-        if not token or raw_ltp is None:
-            return False
-
-        try:
-            raw_ltp_float = float(raw_ltp)
-        except (ValueError, TypeError):
-            return False
-
-        # Reject negative or zero prices
-        if raw_ltp_float <= 0:
-            return False
-
-        ltp = round(raw_ltp_float / 100.0, 2)  # Convert paise to Rupees
-
-        if token == config.NIFTY_SPOT_TOKEN:
-            broadcaster.update_spot(ltp, scrip_master.get_market_now().strftime("%H:%M:%S"))
-            return True
-        elif token in token_map:
-            strike_str, opt_type = token_map[token]
-            broadcaster.update_contract(strike_str, opt_type, ltp)
-            return True
-
-        return False
-    except Exception:
+    tick = normalize_tick_data(message)
+    if not tick:
         return False
 
+    token = tick["token"]
+    if token not in meta_map:
+        return False
 
-def update_subscriptions(
-    new_tokens: List[str],
-    new_token_map: Dict[str, Tuple[str, str]],
-    chunk_size: int = 50,
-    chunk_interval: float = 0.05,
-) -> None:
-    """Dynamically resubscribes to a new set of option contracts when switching expiries."""
-    ws = ACTIVE_SWS_STATE.get("instance")
-    old_tokens = ACTIVE_SWS_STATE.get("tokens", [])
+    info = meta_map[token]
+    category = info.get("category", "")
+    ts_now = scrip_master.get_market_now().strftime("%H:%M:%S")
 
-    # Update active token mapping in-place so incoming ticks route to new strikes
-    ACTIVE_SWS_STATE["token_map"] = dict(new_token_map)
-    ACTIVE_SWS_STATE["tokens"] = list(new_tokens)
+    # 1. Spot & Indices
+    if category == "index":
+        if info.get("name") == "NIFTY_50":
+            broadcaster.update_spot(
+                tick["ltp"],
+                ts_now,
+                high=tick["high"],
+                low=tick["low"],
+                net_change=tick["net_change"]
+            )
+        elif info.get("name") == "INDIA_VIX":
+            # Auto-Scale: If VIX points arrived unscaled (>100), adjust to standard index points
+            vix_ltp = tick["ltp"] / 100.0 if tick["ltp"] > 100.0 else tick["ltp"]
+            broadcaster.update_vix(round(vix_ltp, 2), tick["net_change"])
+        elif info.get("name") == "BANKNIFTY":
+            broadcaster.update_banknifty(tick["ltp"], tick["net_change"])
+        return True
 
-    if ws and hasattr(ws, "unsubscribe") and hasattr(ws, "subscribe"):
-        try:
-            old_nfo = [t for t in old_tokens if t != config.NIFTY_SPOT_TOKEN]
-            for i in range(0, len(old_nfo), chunk_size):
-                chunk = old_nfo[i:i + chunk_size]
-                ws.unsubscribe(
-                    correlation_id=f"unsub_opt_{i}",
-                    mode=1,
-                    token_list=[{"exchangeType": 2, "tokens": chunk}],
-                )
-                time.sleep(chunk_interval)
+    # 2. Market Breadth Heavyweights
+    elif category == "heavyweight":
+        broadcaster.update_heavyweight(
+            info["symbol"],
+            tick["ltp"],
+            tick["net_change"],
+            tick["volume"]
+        )
+        return True
 
-            new_nfo = [t for t in new_tokens if t != config.NIFTY_SPOT_TOKEN]
-            for i in range(0, len(new_nfo), chunk_size):
-                chunk = new_nfo[i:i + chunk_size]
-                ws.subscribe(
-                    correlation_id=f"sub_opt_{i}",
-                    mode=1,
-                    token_list=[{"exchangeType": 2, "tokens": chunk}],
-                )
-                time.sleep(chunk_interval)
+    # 3. Nifty Futures
+    elif category == "futures":
+        broadcaster.update_futures(
+            tick["ltp"],
+            tick["open_interest"],
+            tick["volume"],
+            tick["net_change"]
+        )
+        return True
 
-            print(f"[*] Resubscribed to {len(new_nfo)} options for new expiry.")
-        except Exception as e:
-            print(f"[!] Note on subscription switch: {e}")
+    # 4. Multi-Expiry Options
+    elif category.startswith("options_"):
+        strike_str = str(info["strike"])
+        opt_type = info["option_type"]
+        expiry = info.get("expiry", "")
+        broadcaster.update_option_quote(
+            category=category,
+            expiry=expiry,
+            strike=strike_str,
+            opt_type=opt_type,
+            ltp=tick["ltp"],
+            oi=tick["open_interest"],
+            volume=tick["volume"],
+            high=tick["high"],
+            low=tick["low"],
+            net_change=tick["net_change"]
+        )
+        return True
+
+    return False
 
 
-def generate_session() -> Tuple[str, str]:
-    """
-    Authenticates with Angel One via TOTP, seeds initial Nifty Spot LTP,
-    and returns (jwt_token, feed_token).
-    """
-    # Enforce safe logging before initializing broker SDK
+def subscribe_all_tokens(ws: Any, tokens_by_seg: dict, chunk_size: int = 50, chunk_interval: float = 0.05):
+    """Subscribes to all 92 curated tokens in Mode 2 (Quote Mode)."""
+    # Exchange Type 1: NSE Cash (Indices + Heavyweights)
+    cm_tokens = tokens_by_seg.get("nse_cm", [])
+    if cm_tokens:
+        for i in range(0, len(cm_tokens), chunk_size):
+            chunk = cm_tokens[i:i + chunk_size]
+            ws.subscribe(
+                correlation_id=f"sub_cm_{i}",
+                mode=2,
+                token_list=[{"exchangeType": 1, "tokens": chunk}],
+            )
+            time.sleep(chunk_interval)
+
+    # Exchange Type 2: NSE F&O (Futures + Options)
+    fo_tokens = tokens_by_seg.get("nse_fo", [])
+    if fo_tokens:
+        for i in range(0, len(fo_tokens), chunk_size):
+            chunk = fo_tokens[i:i + chunk_size]
+            ws.subscribe(
+                correlation_id=f"sub_fo_{i}",
+                mode=2,
+                token_list=[{"exchangeType": 2, "tokens": chunk}],
+            )
+            time.sleep(chunk_interval)
+
+    print(f"[*] Subscribed {len(cm_tokens)} Cash + {len(fo_tokens)} F&O tokens in Mode 2 (Quote).")
+
+
+def generate_session() -> Tuple[str, str, float]:
+    """Authenticates via TOTP, seeds Spot via REST, and returns (jwt_token, feed_token, seeded_spot)."""
     security.configure_safe_logging()
 
     valid, missing = config.validate_credentials()
@@ -172,66 +297,44 @@ def generate_session() -> Tuple[str, str]:
         raise RuntimeError("Angel One session response missing jwtToken or feedToken")
     print("[*] Authentication Successful.")
 
-    # Seed initial Spot LTP via REST so Spot is populated before WebSocket ticks arrive
+    seeded_spot = 0.0
     try:
         spot_res = smart.ltpData("NSE", "NIFTY", config.NIFTY_SPOT_TOKEN)
         if spot_res and spot_res.get("status") and spot_res.get("data"):
-            init_ltp = float(spot_res["data"].get("ltp", 0.0))
-            if init_ltp > 0:
-                broadcaster.update_spot(round(init_ltp, 2), scrip_master.get_market_now().strftime("%H:%M:%S"))
-                print(f"[*] Initial Nifty 50 Spot seeded via REST: {init_ltp:.2f}")
+            raw_spot = float(spot_res["data"].get("ltp", 0.0))
+            if raw_spot > 0:
+                seeded_spot = round(raw_spot, 2)
+                broadcaster.update_spot(seeded_spot, scrip_master.get_market_now().strftime("%H:%M:%S"))
+                print(f"[*] Live Nifty 50 Spot fetched via REST: ₹{seeded_spot}")
     except Exception as e:
-        print(f"[!] Note: Initial REST Spot seed skipped ({e}). Waiting for WebSocket tick...")
+        print(f"[!] Initial REST Spot fetch skipped ({e}).")
 
-    return jwt_token, feed_token
+    return jwt_token, feed_token, seeded_spot
 
 
 def start_stream(
     jwt_token: str,
     feed_token: str,
-    tokens_to_subscribe: List[str],
-    token_map: Dict[str, Tuple[str, str]],
+    tokens_by_seg: dict,
+    token_metadata: dict,
     chunk_size: int = 50,
     chunk_interval: float = 0.05,
 ) -> None:
-    """
-    Connects to SmartWebSocketV2, chunks subscriptions, and maintains
-    a resilient bounded exponential backoff reconnection loop.
-    """
-    correlation_id = "nifty_feed_hub"
-    ACTIVE_SWS_STATE["tokens"] = list(tokens_to_subscribe)
-    ACTIVE_SWS_STATE["token_map"] = dict(token_map)
+    """Connects to SmartWebSocketV2 in Mode 2 and manages resilient exponential reconnects."""
+    ACTIVE_SWS_STATE["tokens_by_seg"] = dict(tokens_by_seg)
+    ACTIVE_SWS_STATE["token_metadata"] = dict(token_metadata)
 
     def on_data(*args: Any, **kwargs: Any) -> None:
         message = args[1] if len(args) > 1 else (args[0] if args else None)
-        process_tick_message(message, ACTIVE_SWS_STATE["token_map"])
+        process_tick_message(message, ACTIVE_SWS_STATE["token_metadata"])
 
     def on_open(*args: Any, **kwargs: Any) -> None:
         ws = ACTIVE_SWS_STATE["instance"] or (args[0] if args else None)
         if not ws:
             return
-        print(f"[*] SmartWebSocketV2 Connected! Subscribing in {chunk_size}-token chunks...")
+        print("[*] SmartWebSocketV2 Connected in Mode 2! Subscribing tokens...")
         broadcaster.set_feed_status("CONNECTED")
-
-        # 1. Subscribe Nifty 50 Spot (NSE Cash = Exchange Type 1)
-        ws.subscribe(
-            correlation_id=f"{correlation_id}_spot",
-            mode=1,
-            token_list=[{"exchangeType": 1, "tokens": [config.NIFTY_SPOT_TOKEN]}],
-        )
-
-        # 2. Subscribe NFO Option Contracts in batches (NFO = Exchange Type 2)
-        nfo_tokens = [t for t in ACTIVE_SWS_STATE["tokens"] if t != config.NIFTY_SPOT_TOKEN]
-        for i in range(0, len(nfo_tokens), chunk_size):
-            chunk = nfo_tokens[i:i + chunk_size]
-            ws.subscribe(
-                correlation_id=f"{correlation_id}_opt_{i}",
-                mode=1,
-                token_list=[{"exchangeType": 2, "tokens": chunk}],
-            )
-            time.sleep(chunk_interval)
-
-        print(f"[*] Subscribed Spot + {len(nfo_tokens)} option contracts. Live ticks streaming!")
+        subscribe_all_tokens(ws, ACTIVE_SWS_STATE["tokens_by_seg"], chunk_size, chunk_interval)
 
     def on_error(*args: Any, **kwargs: Any) -> None:
         err = args[1] if len(args) > 1 else (args[0] if args else "Unknown WS Error")
@@ -248,10 +351,9 @@ def start_stream(
     while True:
         connect_start = time.time()
         try:
-            # Refresh session tokens after 3 consecutive failures
             if session_failures >= 3:
                 print("[*] Refreshing session tokens after repeated failures...")
-                jwt_token, feed_token = generate_session()
+                jwt_token, feed_token, _ = generate_session()
                 session_failures = 0
 
             broadcaster.set_feed_status("CONNECTING")
@@ -268,7 +370,6 @@ def start_stream(
             sws.on_close = on_close
             sws.connect()
 
-            # If connection was maintained for over 30 seconds, reset backoff attempt counter
             if time.time() - connect_start > 30:
                 attempt = 1
                 session_failures = 0

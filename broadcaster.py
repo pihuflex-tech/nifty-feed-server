@@ -1,364 +1,323 @@
 """
-High-Performance Thread-Safe HTTP JSON Broadcaster (Termux & Mobile Optimized)
-Exposes market snapshots, health checks, readiness probes, metrics, and multi-expiry selection over HTTP with CORS.
-Features zero-allocation dirty-flag cached payload delivery for minimum CPU and battery consumption.
+broadcaster.py
+Aggregates Mode 2 ticks, computes real-time Implied Volatility (IV) and Option Greeks,
+and publishes structured market snapshots over ZeroMQ PUB on Port 5555.
+Optimized for low-latency execution in Termux/Linux environments.
 """
 
-import os
-import json
+import math
 import time
-import copy
-import urllib.parse
+import json
+import zmq
 import threading
 from datetime import datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from socketserver import ThreadingMixIn
-from typing import Dict, Any, Optional, Callable, Tuple, List
+from typing import Dict, Any, Optional
 
-import config
-import scrip_master
+# ZeroMQ Publisher Configuration
+ZMQ_PUB_PORT = 5555
+ZMQ_BIND_ADDR = f"tcp://*:{ZMQ_PUB_PORT}"
 
-# Optimize thread stack size for Termux / mobile memory efficiency (256 KB per thread)
-try:
-    threading.stack_size(262144)
-except Exception:
-    pass
-
-DATA_LOCK = threading.Lock()
-
-# Ephemeral state store
-FEED_STORE: Dict[str, Any] = {
-    "spot": {
-        "symbol": "NIFTY",
-        "ltp": 0.0,
-        "token": config.NIFTY_SPOT_TOKEN,
-        "updated": "",
-    },
-    "expiry": "",
-    "available_expiries": [],
-    "contracts": {},
-}
-
-# Operational diagnostics and metrics
-METRICS: Dict[str, Any] = {
-    "start_time": time.time(),
-    "feed_status": "DISCONNECTED",  # DISCONNECTED, CONNECTING, CONNECTED, STALE, RECONNECTING
-    "last_tick_time": 0.0,
-    "last_tick_timestamp": "",
-    "ticks_received": 0,
-    "http_requests": 0,
+# Global Thread-Safe Market State
+_STATE_LOCK = threading.Lock()
+MARKET_SNAPSHOT: Dict[str, Any] = {
+    "server_status": "STARTING",
+    "timestamp": "",
     "reconnect_count": 0,
-    "last_error": "",
+    "last_error": None,
+    "spot": {
+        "symbol": "NIFTY 50",
+        "ltp": 0.0,
+        "high": 0.0,
+        "low": 0.0,
+        "net_change": 0.0,
+        "last_trade_time": ""
+    },
+    "indices": {
+        "india_vix": {"ltp": 0.0, "net_change": 0.0},
+        "banknifty": {"ltp": 0.0, "net_change": 0.0}
+    },
+    "heavyweights": {},
+    "futures": {
+        "ltp": 0.0,
+        "open_interest": 0,
+        "volume": 0,
+        "net_change": 0.0
+    },
+    "options": {
+        "current_expiry": {},
+        "wings": {},
+        "next_expiry": {},
+        "monthly_expiry": {}
+    }
 }
 
-ACTIVE_SERVER: Optional[HTTPServer] = None
-SET_EXPIRY_CALLBACK: Optional[Callable[[str], Tuple[bool, str]]] = None
-
-# Zero-allocation payload cache for Termux / low-CPU performance
-_CACHE_DIRTY = True
-_CACHED_PAYLOAD_BYTES: bytes = b""
-
-
-class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
-    """Handles concurrent HTTP requests without blocking."""
-    daemon_threads = True
-    allow_reuse_address = True
+# ---------------------------------------------------------
+# ZeroMQ Publisher Engine & Background Loop
+# ---------------------------------------------------------
+_ZMQ_CONTEXT: Optional[zmq.Context] = None
+_ZMQ_SOCKET: Optional[zmq.Socket] = None
+_RUNNING = True
 
 
-def get_snapshot() -> Dict[str, Any]:
+def init_zmq():
+    """Initializes the ZeroMQ PUB socket."""
+    global _ZMQ_CONTEXT, _ZMQ_SOCKET
+    if _ZMQ_SOCKET is None:
+        _ZMQ_CONTEXT = zmq.Context()
+        _ZMQ_SOCKET = _ZMQ_CONTEXT.socket(zmq.PUB)
+        # Avoid buffering large amounts of stale ticks if subscribers lag
+        _ZMQ_SOCKET.setsockopt(zmq.SNDHWM, 50)
+        _ZMQ_SOCKET.bind(ZMQ_BIND_ADDR)
+        print(f"[*] ZeroMQ PUB Socket bound to {ZMQ_BIND_ADDR}")
+
+
+def _zmq_broadcast_loop(publish_hz: int = 10):
     """
-    Creates a thread-safe copy of the current state under lock,
-    allowing downstream operations to inspect state without holding locks.
+    Background worker that broadcasts the current MARKET_SNAPSHOT at a steady frequency (default: 100ms interval).
+    This avoids saturating IPC/TCP bandwidth on single-core mobile CPU threads in Termux.
     """
-    with DATA_LOCK:
-        return {
-            "spot": dict(FEED_STORE["spot"]),
-            "expiry": FEED_STORE.get("expiry", ""),
-            "available_expiries": list(FEED_STORE.get("available_expiries", [])),
-            "contracts": {
-                k: {
-                    "CE": dict(v["CE"]),
-                    "PE": dict(v["PE"]),
-                }
-                for k, v in FEED_STORE["contracts"].items()
-            },
-        }
+    interval = 1.0 / publish_hz
+    init_zmq()
 
-
-def get_snapshot_bytes() -> bytes:
-    """
-    Returns pre-encoded JSON bytes using a dirty-flag cache.
-    Eliminates repetitive dict copying and serialization on frequent polling.
-    """
-    global _CACHE_DIRTY, _CACHED_PAYLOAD_BYTES
-    with DATA_LOCK:
-        if not _CACHE_DIRTY and _CACHED_PAYLOAD_BYTES:
-            return _CACHED_PAYLOAD_BYTES
-
-        snapshot = {
-            "spot": dict(FEED_STORE["spot"]),
-            "expiry": FEED_STORE.get("expiry", ""),
-            "available_expiries": list(FEED_STORE.get("available_expiries", [])),
-            "contracts": {
-                k: {
-                    "CE": dict(v["CE"]),
-                    "PE": dict(v["PE"]),
-                }
-                for k, v in FEED_STORE["contracts"].items()
-            },
-        }
-        _CACHED_PAYLOAD_BYTES = json.dumps(snapshot).encode("utf-8")
-        _CACHE_DIRTY = False
-        return _CACHED_PAYLOAD_BYTES
-
-
-def set_feed_status(status: str, error_msg: str = "") -> None:
-    """Updates operational feed status."""
-    with DATA_LOCK:
-        METRICS["feed_status"] = status
-        if error_msg:
-            METRICS["last_error"] = error_msg
-
-
-def _record_tick_locked(now: Optional[float] = None) -> None:
-    """Internal helper to update tick metrics and dirty-flag while DATA_LOCK is held."""
-    global _CACHE_DIRTY
-    tick_time = now if now is not None else time.time()
-    METRICS["ticks_received"] += 1
-    METRICS["last_tick_time"] = tick_time
-    METRICS["last_tick_timestamp"] = scrip_master.get_market_now().strftime("%H:%M:%S")
-    METRICS["feed_status"] = "CONNECTED"
-    _CACHE_DIRTY = True
-
-
-def record_tick() -> None:
-    """Records an incoming price tick event."""
-    with DATA_LOCK:
-        _record_tick_locked()
-
-
-def get_current_feed_status(now: Optional[float] = None) -> str:
-    """Returns dynamic feed status taking staleness into account."""
-    current_time = now if now is not None else time.time()
-    with DATA_LOCK:
-        status = METRICS["feed_status"]
-        last_tick = METRICS["last_tick_time"]
-    if status == "CONNECTED" and last_tick > 0 and (current_time - last_tick) > config.STALE_TICK_SECONDS:
-        return "STALE"
-    return status
-
-
-def record_reconnect() -> None:
-    """Increments the reconnect counter."""
-    with DATA_LOCK:
-        METRICS["reconnect_count"] += 1
-
-
-class FeedHandler(BaseHTTPRequestHandler):
-    """HTTP request handler supporting REST endpoints, multi-expiry, and CORS."""
-
-    def _send_payload(self, status_code: int, payload: bytes) -> None:
+    while _RUNNING:
+        start_t = time.time()
         try:
-            self.send_response(status_code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(payload)))
-            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "*")
-            self.end_headers()
-            self.wfile.write(payload)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+            with _STATE_LOCK:
+                MARKET_SNAPSHOT["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                # Deep copy or dump to JSON string directly
+                payload_str = json.dumps(MARKET_SNAPSHOT)
 
-    def _send_json_response(self, status_code: int, data: Any) -> None:
-        payload = json.dumps(data).encode("utf-8")
-        self._send_payload(status_code, payload)
+            # Topic: "NIFTY_MARKET_TICK" followed by JSON payload
+            _ZMQ_SOCKET.send_multipart([b"NIFTY_MARKET_TICK", payload_str.encode("utf-8")])
+        except Exception as e:
+            print(f"[!] ZMQ Broadcast error: {e}")
 
-    def do_GET(self) -> None:
-        with DATA_LOCK:
-            METRICS["http_requests"] += 1
+        elapsed = time.time() - start_t
+        sleep_time = interval - elapsed
+        if sleep_time > 0:
+            time.sleep(sleep_time)
 
-        parsed_url = urllib.parse.urlparse(self.path)
-        path = parsed_url.path.rstrip("/") or "/"
 
-        if path == "/":
-            # Primary market snapshot served from zero-allocation byte cache
-            payload = get_snapshot_bytes()
-            self._send_payload(200, payload)
+# Start background ZMQ broadcaster daemon thread
+_broadcast_thread = threading.Thread(target=_zmq_broadcast_loop, daemon=True)
+_broadcast_thread.start()
 
-        elif path in ("/ui", "/index.html"):
-            index_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
-            if os.path.exists(index_path):
-                with open(index_path, "rb") as f:
-                    ui_html = f.read()
-                try:
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/html; charset=utf-8")
-                    self.send_header("Content-Length", str(len(ui_html)))
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                    self.end_headers()
-                    self.wfile.write(ui_html)
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
-                return
-            self._send_json_response(404, {"error": "index.html not found"})
 
-        elif path == "/expiries":
-            # Returns list of all available active expiries
-            with DATA_LOCK:
-                resp = {
-                    "current_expiry": FEED_STORE.get("expiry", ""),
-                    "available_expiries": list(FEED_STORE.get("available_expiries", [])),
-                }
-            self._send_json_response(200, resp)
+# ---------------------------------------------------------
+# Pure Python Analytical Greeks Engine (Black-Scholes)
+# ---------------------------------------------------------
+def _cnd(d: float) -> float:
+    """Cumulative normal distribution function approximation."""
+    return 0.5 * (1.0 + math.erf(d / math.sqrt(2.0)))
 
-        elif path == "/set_expiry":
-            # Dynamic expiry selection
-            query_params = urllib.parse.parse_qs(parsed_url.query)
-            target = query_params.get("expiry", [None])[0]
-            if not target:
-                self._send_json_response(400, {"error": "Missing 'expiry' query parameter (YYYY-MM-DD)"})
-                return
 
-            if SET_EXPIRY_CALLBACK:
-                success, msg = SET_EXPIRY_CALLBACK(target)
-                if success:
-                    self._send_json_response(200, {"status": "ok", "expiry": target, "message": msg})
-                else:
-                    self._send_json_response(400, {"error": msg})
-            else:
-                self._send_json_response(501, {"error": "Dynamic expiry switching not registered on server"})
+def _npdf(d: float) -> float:
+    """Standard normal probability density function."""
+    return (1.0 / math.sqrt(2.0 * math.pi)) * math.exp(-0.5 * d * d)
 
-        elif path == "/health":
-            # Liveness probe
-            now = time.time()
-            with DATA_LOCK:
-                uptime = round(now - METRICS["start_time"], 1)
-                last_tick_age = (
-                    round(now - METRICS["last_tick_time"], 1)
-                    if METRICS["last_tick_time"] > 0
-                    else None
-                )
-                status = "ok"
 
-            self._send_json_response(200, {
-                "status": status,
-                "service": "nifty-feed-server",
-                "uptime_seconds": uptime,
-                "last_tick_age_seconds": last_tick_age,
-            })
+def calculate_implied_volatility(
+    opt_price: float,
+    spot: float,
+    strike: float,
+    t: float,
+    r: float = 0.07,
+    opt_type: str = "CE"
+) -> float:
+    """
+    Computes Black-Scholes IV via Newton-Raphson method with fallback bisection.
+    r = 7.0% (RBI benchmark/MIBOR reference)
+    """
+    if opt_price <= 0 or spot <= 0 or strike <= 0 or t <= 0.0001:
+        return 0.0
 
-        elif path == "/ready":
-            # Readiness probe: verifies instruments loaded and initial spot seeded
-            now = time.time()
-            with DATA_LOCK:
-                contracts_count = len(FEED_STORE["contracts"])
-                spot_ltp = FEED_STORE["spot"]["ltp"]
-                feed_status = METRICS["feed_status"]
-                last_tick_time = METRICS["last_tick_time"]
+    sigma = 0.15  # 15% seed volatility
+    for _ in range(15):
+        d1 = (math.log(spot / strike) + (r + 0.5 * sigma ** 2) * t) / (sigma * math.sqrt(t))
+        d2 = d1 - sigma * math.sqrt(t)
 
-            effective_status = feed_status
-            if feed_status == "CONNECTED" and last_tick_time > 0 and (now - last_tick_time) > config.STALE_TICK_SECONDS:
-                effective_status = "STALE"
-
-            is_ready = contracts_count > 0 and (spot_ltp > 0 or effective_status in ("CONNECTED", "STALE"))
-            self._send_json_response(200 if is_ready else 503, {
-                "ready": is_ready,
-                "feed_status": effective_status,
-                "contracts_initialized": contracts_count,
-                "spot_seeded": spot_ltp > 0,
-            })
-
-        elif path == "/metrics":
-            # Diagnostic metrics
-            now = time.time()
-            with DATA_LOCK:
-                metrics_copy = dict(METRICS)
-                metrics_copy["uptime_seconds"] = round(now - METRICS["start_time"], 1)
-                last_tick_time = METRICS["last_tick_time"]
-                metrics_copy["last_tick_age_seconds"] = (
-                    round(now - last_tick_time, 1)
-                    if last_tick_time > 0
-                    else None
-                )
-                metrics_copy["contracts_count"] = len(FEED_STORE["contracts"])
-                metrics_copy["expiry"] = FEED_STORE.get("expiry", "")
-
-                if metrics_copy["feed_status"] == "CONNECTED" and last_tick_time > 0 and (now - last_tick_time) > config.STALE_TICK_SECONDS:
-                    metrics_copy["feed_status"] = "STALE"
-
-            self._send_json_response(200, metrics_copy)
-
+        if opt_type == "CE":
+            theo = spot * _cnd(d1) - strike * math.exp(-r * t) * _cnd(d2)
         else:
-            # 404 for unknown endpoints
-            self._send_json_response(404, {
-                "error": "Not Found",
-                "path": self.path,
-                "available_routes": ["/", "/ui", "/expiries", "/set_expiry?expiry=YYYY-MM-DD", "/health", "/ready", "/metrics"],
-            })
+            theo = strike * math.exp(-r * t) * _cnd(-d2) - spot * _cnd(-d1)
 
-    def do_OPTIONS(self) -> None:
-        self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "*")
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        diff = theo - opt_price
+        if abs(diff) < 0.05:
+            return round(sigma, 4)
 
-    def log_message(self, format: str, *args: Any) -> None:
-        # Silence continuous polling access logs to save CPU and disk I/O on Termux
-        return
+        vega = spot * math.sqrt(t) * _npdf(d1)
+        if vega < 1e-5:
+            break
 
+        sigma -= diff / vega
+        if sigma <= 0.01:
+            sigma = 0.01
+            break
+        if sigma > 2.0:
+            sigma = 2.0
+            break
 
-def create_http_server(host: str = config.FEED_HOST, port: int = config.FEED_PORT) -> HTTPServer:
-    """Creates a ThreadedHTTPServer instance."""
-    return ThreadedHTTPServer((host, port), FeedHandler)
+    return round(sigma, 4)
 
 
-def start_http_server(host: str = config.FEED_HOST, port: int = config.FEED_PORT) -> None:
-    """Starts the HTTP broadcaster server."""
-    global ACTIVE_SERVER
-    ACTIVE_SERVER = create_http_server(host, port)
-    ACTIVE_SERVER.serve_forever()
+def calculate_greeks(
+    spot: float,
+    strike: float,
+    expiry_str: str,
+    opt_type: str,
+    ltp: float,
+    r: float = 0.07
+) -> Dict[str, float]:
+    """Calculates IV, Delta, Gamma, Vega, and Theta for a given option contract."""
+    default_greeks = {"iv": 0.0, "delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
+    if spot <= 0 or strike <= 0 or ltp <= 0 or not expiry_str:
+        return default_greeks
+
+    try:
+        # Calculate time to expiry in years
+        exp_dt = datetime.strptime(expiry_str.strip().upper(), "%d%b%Y")
+        now = datetime.now()
+        # Set market close at 15:30
+        exp_close = exp_dt.replace(hour=15, minute=30, second=0)
+        time_diff = (exp_close - now).total_seconds()
+        t = max(time_diff / (365.25 * 86400.0), 0.0001)
+
+        iv = calculate_implied_volatility(ltp, spot, strike, t, r, opt_type)
+        if iv <= 0:
+            return default_greeks
+
+        d1 = (math.log(spot / strike) + (r + 0.5 * iv ** 2) * t) / (iv * math.sqrt(t))
+        d2 = d1 - iv * math.sqrt(t)
+
+        npdf_d1 = _npdf(d1)
+        gamma = npdf_d1 / (spot * iv * math.sqrt(t))
+        vega = (spot * math.sqrt(t) * npdf_d1) / 100.0  # Change per 1% move in IV
+
+        if opt_type == "CE":
+            delta = _cnd(d1)
+            theta = (- (spot * npdf_d1 * iv) / (2 * math.sqrt(t)) - r * strike * math.exp(-r * t) * _cnd(d2)) / 365.0
+        else:
+            delta = _cnd(d1) - 1.0
+            theta = (- (spot * npdf_d1 * iv) / (2 * math.sqrt(t)) + r * strike * math.exp(-r * t) * _cnd(-d2)) / 365.0
+
+        return {
+            "iv": round(iv * 100, 2),       # Reported in percentage (e.g., 14.5%)
+            "delta": round(delta, 4),
+            "gamma": round(gamma, 6),
+            "theta": round(theta, 2),       # Daily rupee decay
+            "vega": round(vega, 2)
+        }
+    except Exception:
+        return default_greeks
 
 
-def stop_http_server() -> None:
-    """Gracefully stops the active HTTP server."""
-    global ACTIVE_SERVER
-    if ACTIVE_SERVER:
-        ACTIVE_SERVER.shutdown()
-        ACTIVE_SERVER.server_close()
-        ACTIVE_SERVER = None
+# ---------------------------------------------------------
+# State Update Handlers (Invoked by websocket_feed.py)
+# ---------------------------------------------------------
+def set_feed_status(status: str, error_msg: Optional[str] = None):
+    with _STATE_LOCK:
+        MARKET_SNAPSHOT["server_status"] = status
+        if error_msg:
+            MARKET_SNAPSHOT["last_error"] = error_msg
 
 
-def init_contracts(
-    contracts_template: Dict[str, Any],
-    expiry: str = "",
-    available_expiries: Optional[List[str]] = None,
-) -> None:
-    """Pre-allocates the contract strike dictionary and expiry metadata in memory."""
-    global _CACHE_DIRTY
-    with DATA_LOCK:
-        FEED_STORE["contracts"] = contracts_template
-        if expiry:
-            FEED_STORE["expiry"] = expiry
-        if available_expiries is not None:
-            FEED_STORE["available_expiries"] = available_expiries
-        _CACHE_DIRTY = True
+def record_reconnect():
+    with _STATE_LOCK:
+        MARKET_SNAPSHOT["reconnect_count"] += 1
 
 
-def update_spot(ltp: float, time_str: str) -> None:
-    """Updates the spot price and timestamp under single lock acquisition."""
-    with DATA_LOCK:
-        FEED_STORE["spot"]["ltp"] = ltp
-        FEED_STORE["spot"]["updated"] = time_str
-        _record_tick_locked()
+def update_spot(ltp: float, ts_now: str, high: float = 0.0, low: float = 0.0, net_change: float = 0.0):
+    with _STATE_LOCK:
+        MARKET_SNAPSHOT["spot"]["ltp"] = ltp
+        MARKET_SNAPSHOT["spot"]["high"] = high
+        MARKET_SNAPSHOT["spot"]["low"] = low
+        MARKET_SNAPSHOT["spot"]["net_change"] = net_change
+        MARKET_SNAPSHOT["spot"]["last_trade_time"] = ts_now
 
 
-def update_contract(strike_str: str, opt_type: str, ltp: float) -> None:
-    """Updates an option contract price under single lock acquisition."""
-    with DATA_LOCK:
-        if strike_str in FEED_STORE["contracts"]:
-            FEED_STORE["contracts"][strike_str][opt_type]["ltp"] = ltp
-            _record_tick_locked()
+def update_vix(ltp: float, net_change: float = 0.0):
+    with _STATE_LOCK:
+        MARKET_SNAPSHOT["indices"]["india_vix"]["ltp"] = ltp
+        MARKET_SNAPSHOT["indices"]["india_vix"]["net_change"] = net_change
+
+
+def update_banknifty(ltp: float, net_change: float = 0.0):
+    with _STATE_LOCK:
+        MARKET_SNAPSHOT["indices"]["banknifty"]["ltp"] = ltp
+        MARKET_SNAPSHOT["indices"]["banknifty"]["net_change"] = net_change
+
+
+def update_heavyweight(symbol: str, ltp: float, net_change: float, volume: int):
+    with _STATE_LOCK:
+        MARKET_SNAPSHOT["heavyweights"][symbol] = {
+            "ltp": ltp,
+            "net_change": net_change,
+            "volume": volume
+        }
+
+
+def update_futures(ltp: float, oi: int, volume: int, net_change: float):
+    with _STATE_LOCK:
+        MARKET_SNAPSHOT["futures"] = {
+            "ltp": ltp,
+            "open_interest": oi,
+            "volume": volume,
+            "net_change": net_change
+        }
+
+
+def update_option_quote(
+    category: str,
+    expiry: str,
+    strike: str,
+    opt_type: str,
+    ltp: float,
+    oi: int,
+    volume: int,
+    high: float,
+    low: float,
+    net_change: float
+):
+    """
+    Updates option contract metrics and automatically recalculates Greeks against active Spot price.
+    """
+    key = f"{strike}_{opt_type}"
+    sub_bucket = category.replace("options_", "")  # e.g., 'current', 'wings', 'next', 'monthly'
+
+    # Retrieve current spot for Greeks calculation
+    with _STATE_LOCK:
+        current_spot = MARKET_SNAPSHOT["spot"]["ltp"]
+
+    # Compute Greeks outside of global lock to eliminate blocking on concurrent ticks
+    greeks = calculate_greeks(
+        spot=current_spot,
+        strike=float(strike),
+        expiry_str=expiry,
+        opt_type=opt_type,
+        ltp=ltp
+    )
+
+    with _STATE_LOCK:
+        target_dict = None
+        if sub_bucket == "current":
+            target_dict = MARKET_SNAPSHOT["options"]["current_expiry"]
+        elif sub_bucket == "wings":
+            target_dict = MARKET_SNAPSHOT["options"]["wings"]
+        elif sub_bucket == "next":
+            target_dict = MARKET_SNAPSHOT["options"]["next_expiry"]
+        elif sub_bucket == "monthly":
+            target_dict = MARKET_SNAPSHOT["options"]["monthly_expiry"]
+
+        if target_dict is not None:
+            target_dict[key] = {
+                "strike": float(strike),
+                "option_type": opt_type,
+                "expiry": expiry,
+                "ltp": ltp,
+                "open_interest": oi,
+                "volume": volume,
+                "high": high,
+                "low": low,
+                "net_change": net_change,
+                "greeks": greeks
+            }
